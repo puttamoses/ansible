@@ -1,0 +1,26 @@
+# k8s/frontend-service.yaml
+# AWS ALB (Application Load Balancer) for the frontend
+# ALB is Layer 7 — supports HTTP/HTTPS, host-based routing
+#
+# After applying, run:
+#   kubectl get svc car-frontend -n autoelite
+# The EXTERNAL-IP is your ALB DNS — share this URL with users.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: car-frontend
+  namespace: autoelite
+  annotations:
+    # AWS ALB — use for frontend (HTTP/HTTPS)
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+spec:
+  selector:
+    app: car-frontend
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP

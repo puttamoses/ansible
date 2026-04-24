@@ -1,0 +1,254 @@
+// ─────────────────────────────────────────────
+//  car-frontend — CI Pipeline
+//
+//  Stage 1 — Checkout
+//  Stage 2 — Build
+//  Stage 3 — Test + Coverage
+//  Stage 4 — SCA  (npm audit + OWASP)
+//  Stage 5 — SAST (Semgrep)
+//  Stage 6 — Quality Gate (SonarQube)
+//  Stage 7 — Docker Build + Push to ECR
+//
+//  On success → triggers car-frontend-cd automatically
+// ─────────────────────────────────────────────
+
+pipeline {
+
+    agent any
+
+    tools {
+        nodejs 'NodeJS-20'
+    }
+
+    environment {
+        AWS_REGION        = 'ap-south-1'                     // ✅ your region
+        AWS_ACCOUNT_ID    = credentials('aws-account-id')
+        ECR_REPOSITORY    = 'car-frontend'
+        SONAR_HOST_URL    = 'http://your-sonar-server:9000'  // ✅ your SonarQube URL
+        SONAR_TOKEN       = credentials('sonar-token')
+        // ✅ Backend ALB DNS — set in Jenkins credentials after backend deploys
+        REACT_APP_API_URL = credentials('react-app-api-url')
+        IMAGE_TAG         = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7)}"
+        ECR_REGISTRY      = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_URI         = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+    }
+
+    options {
+        timestamps()
+        timeout(time: 40, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Stage 1 | Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Stage 2 | Build') {
+            steps {
+                dir('car-frontend') {
+                    sh '''
+                        npm ci
+
+                        # Inject backend URL from Jenkins secret into .env.production
+                        # React reads this file during npm run build
+                        echo "REACT_APP_API_URL=${REACT_APP_API_URL}" > .env.production
+
+                        npm run build
+                        echo "✅ React build complete"
+                    '''
+                }
+            }
+        }
+
+        stage('Stage 3 | Test & Coverage') {
+            steps {
+                dir('car-frontend') {
+                    sh '''
+                        npm test -- \
+                            --coverage \
+                            --watchAll=false \
+                            --coverageReporters=lcov \
+                            --coverageReporters=text \
+                            --ci
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true,
+                          testResults: 'car-frontend/coverage/junit.xml'
+
+                    publishHTML([
+                        allowMissing         : false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll              : true,
+                        reportDir            : 'car-frontend/coverage/lcov-report',
+                        reportFiles          : 'index.html',
+                        reportName           : 'Frontend Coverage Report'
+                    ])
+
+                    archiveArtifacts artifacts: 'car-frontend/coverage/lcov.info',
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Stage 4 | SCA') {
+            parallel {
+
+                stage('npm audit') {
+                    steps {
+                        dir('car-frontend') {
+                            sh '''
+                                npm audit --audit-level=high \
+                                    --json > npm-audit.json || true
+                                npm audit --audit-level=high || \
+                                    echo "WARNING: High vulnerabilities found"
+                            '''
+                        }
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'car-frontend/npm-audit.json',
+                                             allowEmptyArchive: true
+                        }
+                    }
+                }
+
+                stage('OWASP Dependency-Check') {
+                    steps {
+                        dir('car-frontend') {
+                            dependencyCheck(
+                                additionalArguments: '''
+                                    --scan .
+                                    --exclude node_modules
+                                    --format HTML
+                                    --format XML
+                                    --failOnCVSS 8
+                                    --enableRetired
+                                    --out dependency-check-report
+                                ''',
+                                odcInstallation: 'OWASP-DC'
+                            )
+                        }
+                    }
+                    post {
+                        always {
+                            dependencyCheckPublisher(
+                                pattern: 'car-frontend/dependency-check-report/dependency-check-report.xml',
+                                failedTotalCritical: 1,
+                                failedTotalHigh: 5
+                            )
+                        }
+                    }
+                }
+
+            }
+        }
+
+        stage('Stage 5 | SAST') {
+            steps {
+                dir('car-frontend') {
+                    sh '''
+                        pip3 install semgrep --quiet 2>/dev/null || true
+
+                        semgrep scan \
+                            --config p/react \
+                            --config p/javascript \
+                            --config p/owasp-top-ten \
+                            --config p/xss \
+                            --json \
+                            --output semgrep-report.json \
+                            src/ || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'car-frontend/semgrep-report.json',
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Stage 6 | Quality Gate') {
+            steps {
+                dir('car-frontend') {
+                    withSonarQubeEnv('SonarQube') {
+                        sh '''
+                            npx sonar-scanner \
+                                -Dsonar.projectKey=car-frontend \
+                                -Dsonar.projectName="Car Frontend" \
+                                -Dsonar.projectVersion=${BUILD_NUMBER} \
+                                -Dsonar.sources=src \
+                                -Dsonar.exclusions=node_modules/**,build/**,coverage/**,**/*.test.jsx \
+                                -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                                -Dsonar.externalIssuesReportPaths=semgrep-report.json \
+                                -Dsonar.host.url=${SONAR_HOST_URL} \
+                                -Dsonar.login=${SONAR_TOKEN}
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+
+        stage('Stage 7 | Docker Build & Push to ECR') {
+            steps {
+                dir('car-frontend') {
+                    withCredentials([[
+                        $class       : 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-credentials'
+                    ]]) {
+                        sh '''
+                            aws ecr get-login-password --region ${AWS_REGION} | \
+                                docker login \
+                                    --username AWS \
+                                    --password-stdin \
+                                    ${ECR_REGISTRY}
+
+                            docker build \
+                                -t ${IMAGE_URI} \
+                                -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
+
+                            docker push ${IMAGE_URI}
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+                            echo "✅ Pushed: ${IMAGE_URI}"
+                        '''
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "✅ CI passed — triggering CD with image: ${IMAGE_URI}"
+            build job: 'car-frontend-cd',
+                  parameters: [string(name: 'IMAGE_URI', value: "${IMAGE_URI}")],
+                  wait: false
+        }
+        failure {
+            echo '❌ CI failed — CD will NOT be triggered'
+        }
+        always {
+            sh 'docker image prune -f || true'
+            cleanWs()
+        }
+    }
+
+}

@@ -1,0 +1,39 @@
+# k8s/ingress.yaml
+# AWS ALB (Application Load Balancer) Ingress
+#
+# Prerequisites — install AWS Load Balancer Controller on your EKS cluster:
+#   https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html
+#
+# After applying, get the ALB DNS:
+#   kubectl get ingress -n autoelite
+#   Copy ADDRESS (looks like: xxxxx.us-east-1.elb.amazonaws.com)
+#   Point your domain DNS → that ADDRESS (CNAME record)
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: autoelite-ingress
+  namespace: autoelite
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # ✅ Your AWS region
+    alb.ingress.kubernetes.io/region: us-east-1
+    # Optional: HTTPS — add your ACM certificate ARN
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/CERT_ID
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    # alb.ingress.kubernetes.io/ssl-redirect: "443"
+spec:
+  rules:
+    # ✅ Change to your domain (or use ALB DNS directly for testing)
+    - host: yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: car-frontend
+                port:
+                  number: 80

@@ -1,0 +1,174 @@
+// ─────────────────────────────────────────────
+//  car-backend — CI Pipeline (UPDATED)
+// ─────────────────────────────────────────────
+
+pipeline {
+
+    agent any
+
+    tools {
+        nodejs 'NodeJS-20'
+    }
+
+    environment {
+        AWS_REGION     = 'ap-south-1'
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        ECR_REPOSITORY = 'car-backend'
+
+        SONAR_HOST_URL = 'http://your-sonar-server:9000'
+        SONAR_TOKEN    = credentials('sonar-token')
+
+        IMAGE_TAG    = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7)}"
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_URI    = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+    }
+
+    options {
+        timestamps()
+        timeout(time: 40, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Stage 1 | Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Stage 2 | Build') {
+            steps {
+                dir('car-backend') {
+                    sh 'npm ci'
+                }
+            }
+        }
+
+        stage('Stage 3 | Test & Coverage') {
+            steps {
+                dir('car-backend') {
+                    sh '''
+                        npm test -- \
+                        --coverage \
+                        --coverageReporters=lcov \
+                        --coverageReporters=text \
+                        --forceExit \
+                        --ci
+                    '''
+                }
+            }
+        }
+
+        stage('Stage 4 | SCA') {
+            parallel {
+
+                stage('npm audit') {
+                    steps {
+                        dir('car-backend') {
+                            sh '''
+                                npm audit --audit-level=high \
+                                --json > npm-audit.json || true
+                            '''
+                        }
+                    }
+                }
+
+                stage('OWASP Dependency-Check') {
+                    steps {
+                        dir('car-backend') {
+                            dependencyCheck(
+                                additionalArguments: '''
+                                    --scan .
+                                    --format JSON   // ✅ added
+                                    --format XML
+                                    --enableRetired
+                                    --out dependency-check-report
+                                ''',
+                                odcInstallation: 'OWASP-DC'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Stage 5 | SAST') {
+            steps {
+                dir('car-backend') {
+                    sh '''
+                        pip3 install semgrep --quiet || true
+
+                        semgrep scan \
+                            --config p/nodejs \
+                            --config p/owasp-top-ten \
+                            --config p/security-audit \
+                            --json \
+                            --output semgrep-report.json \
+                            . || true
+                    '''
+                }
+            }
+        }
+
+        stage('Stage 6 | Quality Gate') {
+            steps {
+                dir('car-backend') {
+                    withSonarQubeEnv('SonarQube') {
+                        sh '''
+                            npx sonar-scanner \
+                                -Dsonar.projectKey=car-backend \
+                                -Dsonar.sources=. \
+                                -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                                -Dsonar.externalIssuesReportPaths=semgrep-report.json,dependency-check-report/dependency-check-report.json \
+                                -Dsonar.host.url=${SONAR_HOST_URL} \
+                                -Dsonar.login=${SONAR_TOKEN}
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+
+        stage('Stage 7 | Docker Build & Push to ECR') {
+            steps {
+                dir('car-backend') {
+                    withCredentials([[
+                        $class       : 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-credentials'
+                    ]]) {
+                        sh '''
+                            aws ecr get-login-password --region ${AWS_REGION} | \
+                                docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                            docker build \
+                                -t ${IMAGE_URI} \
+                                -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
+
+                            docker push ${IMAGE_URI}
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            build job: 'car-backend-cd',
+                  parameters: [string(name: 'IMAGE_URI', value: "${IMAGE_URI}")],
+                  wait: false
+        }
+        always {
+            sh 'docker system prune -f || true'
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,18 @@
+# k8s/configmap.yaml
+# Non-secret config values for the cluster
+#
+# REACT_APP_API_URL is NOT set here because:
+# - It is baked into the frontend image at build time
+# - You set it in .env.production BEFORE building the Docker image
+# - After deploying backend, get its NLB DNS from:
+#     kubectl get svc car-backend -n autoelite
+#   Then set .env.production → rebuild frontend image → push → deploy
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoelite-config
+  namespace: autoelite
+data:
+  PORT: "5000"
+  NODE_ENV: "production"

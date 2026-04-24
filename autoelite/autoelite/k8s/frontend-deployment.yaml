@@ -1,0 +1,46 @@
+# k8s/frontend-deployment.yaml
+# ✅ Replace YOUR_AWS_ACCOUNT_ID, YOUR_REGION, and image tag
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: car-frontend
+  namespace: autoelite
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: car-frontend
+  template:
+    metadata:
+      labels:
+        app: car-frontend
+    spec:
+      containers:
+        - name: car-frontend
+
+          # ✅ Change to your ECR image URI
+          image: YOUR_AWS_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/car-frontend:latest
+
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
